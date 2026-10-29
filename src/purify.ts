@@ -1135,7 +1135,27 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         typeof element.setAttribute !== 'function' ||
         typeof element.namespaceURI !== 'string' ||
         typeof element.insertBefore !== 'function' ||
-        typeof element.hasChildNodes !== 'function')
+        typeof element.hasChildNodes !== 'function' ||
+        // NodeType clobbering probe. Cached Node.prototype.nodeType getter
+        // returns the integer 1 for any Element regardless of realm; direct
+        // read on a clobbered form (e.g. <input name="nodeType">) returns
+        // the named child element. Cheap addition — nodeType is read from
+        // an internal slot, no serialization cost — and removes a residual
+        // clobbering surface used by several mXSS / PI / comment branches
+        // in _sanitizeElements that compare currentNode.nodeType directly.
+        element.nodeType !== getNodeType(element) ||
+        // HTMLFormElement has [LegacyOverrideBuiltIns]: a descendant named
+        // "childNodes" shadows the prototype getter. Direct reads of
+        // form.childNodes from a clobbered form return the named child
+        // instead of the real NodeList, so any walk that reads it directly
+        // skips the form's real children. Compare the direct read to the
+        // cached Node.prototype getter — when the form's named-property
+        // getter intercepts the read, the two values differ and we flag
+        // the form. This catches every clobbering child type (input,
+        // select, etc.) regardless of whether the named child happens to
+        // carry a numeric .length, which a typeof-based probe would miss
+        // (e.g. HTMLSelectElement.length is a defined unsigned-long).
+        element.childNodes !== getChildNodes(element))
     );
   };
 
@@ -1273,10 +1293,17 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         }
       }
 
-      /* Keep content except for bad-listed elements */
+      /* Keep content except for bad-listed elements.
+         Use the cached prototype getters exclusively — the previous code
+         had `|| currentNode.parentNode` / `|| currentNode.childNodes`
+         fallbacks, but the cached getters always return the canonical
+         value (or null for a real parent-less node), so the fallback
+         path was dead in safe cases and a clobbering surface in unsafe
+         ones. Falsy cached results stay falsy; the `if (childNodes &&
+         parentNode)` check already gates correctly. */
       if (KEEP_CONTENT && !FORBID_CONTENTS[tagName]) {
-        const parentNode = getParentNode(currentNode) || currentNode.parentNode;
-        const childNodes = getChildNodes(currentNode) || currentNode.childNodes;
+        const parentNode = getParentNode(currentNode);
+        const childNodes = getChildNodes(currentNode);
 
         if (childNodes && parentNode) {
           const childCount = childNodes.length;
@@ -1767,6 +1794,22 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
             'root node is forbidden and cannot be sanitized in-place'
           );
         }
+      }
+
+      /* Pre-flight the root through _isClobbered. The iterator-driven
+         removal path can not detach a parent-less root: _forceRemove
+         falls through to Element.prototype.remove(), which per spec
+         is a no-op on a node with no parent. A clobbered root would
+         then survive the main loop with its attributes uninspected,
+         because _sanitizeAttributes early-returns on _isClobbered. The
+         result would be an attacker-controlled form, complete with any
+         event-handler attributes the caller passed in, handed back to
+         the application unsanitized. Refuse to sanitize such a root
+         the same way we refuse a forbidden tag. GHSA-r47g-fvhr-h676. */
+      if (_isClobbered(dirty as Element)) {
+        throw typeErrorCreate(
+          'root node is clobbered and cannot be sanitized in-place'
+        );
       }
 
       /* Sanitize attached shadow roots before the main iterator runs.
